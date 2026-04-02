@@ -223,6 +223,7 @@ set(OPS_CATEGORY_LIST
   "math"
   "conversion"
   "random"
+  "vector"
 )
 
 # mapping of soc full name and short name
