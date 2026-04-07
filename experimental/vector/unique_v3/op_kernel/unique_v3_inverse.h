@@ -3,7 +3,7 @@
 using namespace AscendC;
 
 
-#ifndef MDZZ
+#ifdef ASEND950
 
 __simt_vf__ __launch_bounds__ (1024) inline void SimtScatterInverse(
     __gm__ int32_t* inverseResult,    // inverse输出数组（全局地址）
@@ -35,8 +35,6 @@ __simt_vf__ __launch_bounds__ (1024) inline void SimtScatterInverse(
 }
 
 #endif
-
-
 
 namespace NsUniqueV3
 {
@@ -227,8 +225,8 @@ template<typename T>
 __aicore__ inline void KernelUnique<T>::CopyOutInverse()
 {
 
-#ifndef MDZZ
-
+#ifdef ASEND950
+    // 如果支持SIMT的ascend950，直接用SIMT来做scatter inverse
     __gm__ int32_t* inverseResultPtr = (__gm__ int32_t*)inverseResult.GetPhyAddr();
     __gm__ int32_t* inverseDataPtr   = (__gm__ int32_t*)inverseGlobal2.GetPhyAddr();
 

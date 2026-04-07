@@ -14,6 +14,7 @@
  */
 
 #include "unique_v3.h"
+#include "unique_v3_unique.h"
 #include "unique_v3_counts.h"
 #include "unique_v3_inverse.h"
 

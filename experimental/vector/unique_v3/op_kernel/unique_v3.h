@@ -7,7 +7,7 @@
 #include "kernel_tiling/kernel_tiling.h"
 #include "unique_v3_tiling_data.h"
 #include "unique_v3_tiling_key.h"
-#include "unique_v3_tools.h"
+#include "unique_v3_commons.h"
 
 
 namespace NsUniqueV3 {
@@ -66,6 +66,8 @@ private:
         const LocalTensor<float>& srcLocal, const LocalTensor<float>& shiftedLocal,
         const LocalTensor<uint32_t>& bitMask16, const uint16_t elemLength, uint64_t& tileUniqueCnt);
     __aicore__ inline void TileUnique(const int32_t progress);
+
+    __aicore__ inline void CopyOutUnique();
     __aicore__ inline void CopyOutCounts();
     __aicore__ inline void CopyOutInverse();
     __aicore__ inline void CopyOut();
@@ -101,7 +103,7 @@ private:
     GlobalTensor<T> sortedBlock2;
 
     GlobalTensor<int32_t> IBSyncGlobal;
-    GlobalTensor<uint32_t> blockUniqueCntGlobal;
+    GlobalTensor<float> uniqueMsg;
 
     GlobalTensor<int32_t> counterGlobal;
     GlobalTensor<float> counterMsg;
@@ -171,6 +173,9 @@ __aicore__ inline void KernelUnique<T>::Init(
     // 初始化核间同步 GM临时空间
     IBSyncGlobal.SetGlobalBuffer((__gm__ int32_t*)workspace + alignedTotalLength * SORT_DATATYPE_SIZE_FACTOR * 2, syncWorkspaceSize);
 
+    // 初始化unique的核间同步计数空间
+    uniqueMsg.SetGlobalBuffer((__gm__ float*)workspace + alignedTotalLength * SORT_DATATYPE_SIZE_FACTOR * 2 + syncWorkspaceSize, ((blockNum + 7) / 8 * 8) * 3); 
+
     // 初始化counter及inverse GM临时空间
     uint32_t counterOffset = alignedTotalLength * 4 + syncWorkspaceSize + (blockNum + 7) / 8 * 8;
     uint32_t inverstOffset = counterOffset + alignedTotalLength + ((blockNum + 7) / 8 * 8) * 3;
@@ -197,9 +202,6 @@ __aicore__ inline size_t KernelUnique<T>::GetGlobalOffset(const uint32_t blockId
     return offset;
 }
 
-
-
-
 template<typename T>
 __aicore__ inline void KernelUnique<T>::Process()
 {
@@ -217,11 +219,10 @@ __aicore__ inline void KernelUnique<T>::Process()
     if (flagCounts) CalculateCounts();
     // inverse计算
     if (flagInverse) CalculateInverse();
-
     // 去重
     CalculateUnique();
-
     SyncAll();
+
     // 结果写出
     CopyOut();
 }
@@ -243,8 +244,7 @@ __aicore__ inline void KernelUnique<T>::SortTile()
         AscendC::Arange(arange, static_cast<int32_t>(globalOffset + i * TILE_LENGTH), 1, tileLen);
         LocalTensor<float> dstLocal = calcBuf[2].Get<float>();
 	//255个repeat超限 拆成两次排
-	if(repeat <=128)
-            AscendC::Sort32<float>(dstLocal, input, arange.ReinterpretCast<uint32_t>(), repeat);
+	if(repeat <=128) AscendC::Sort32<float>(dstLocal, input, arange.ReinterpretCast<uint32_t>(), repeat);
 	else {
 	    AscendC::Sort32<float>(dstLocal, input, arange.ReinterpretCast<uint32_t>(), 128);
 	    AscendC::Sort32<float>(dstLocal[TILE_LENGTH], input[TILE_LENGTH / 2], arange[TILE_LENGTH / 2].ReinterpretCast<uint32_t>(), repeat - 128);
@@ -315,9 +315,6 @@ __aicore__ inline bool KernelUnique<T>::MrgTile(
 }
 
 
-// ======================== Binary Search Helper ========================
-// For ascending sorted data in GM (interleaved val+idx format),
-// find the count of elements starting from startElem (up to maxCount) whose value <= target.
 template <typename T>
 __aicore__ inline int32_t KernelUnique<T>::BinarySearchLE(
     const GlobalTensor<T>& gm, int32_t startElem, int32_t maxCount, T target)
@@ -342,10 +339,6 @@ __aicore__ inline int32_t KernelUnique<T>::BinarySearchLE(
     return lo + 1;
 }
 
-// ======================== Merge Group On GM ========================
-// Merge numSeqs (2~4) ascending sorted sequences from srcGM into dstGM.
-// Uses pre-computed split points: for each round, read boundary values from GM,
-// find the minimum, binary search others, then load into UB and MrgSort.
 template <typename T>
 __aicore__ inline void KernelUnique<T>::MergeGroupOnGM(
     GlobalTensor<T>& dstGM, int32_t dstElemOffset,
@@ -466,9 +459,8 @@ __aicore__ inline void KernelUnique<T>::MergeGroupOnGM(
         } else {
             // Execute MrgSort with compact buffers
             uint16_t validBit = (1 << mrgBufIdx) - 1;
-            AscendC::MrgSort4Info mrgParams = {
-                {elemLens[0], elemLens[1], elemLens[2], elemLens[3]},
-                false, validBit, 1};
+
+            AscendC::MrgSort4Info mrgParams = {elemLens, false, validBit, 1};
 
             AscendC::MrgSortSrcList<float> srcList;
             srcList.src1 = buf0;
@@ -502,49 +494,43 @@ __aicore__ inline void KernelUnique<T>::MergeGroupOnGM(
     }
 }
 
-// ======================== MrgBlock: Intra-core Tile Merge ========================
-// Multi-level 4-way merge of sorted tiles within a block.
-// E.g., 61 tiles -> 16 groups -> 4 groups -> 1 final sorted sequence.
-// Ping-pongs between sortedBlock1 and sortedBlock2.
+
 template <typename T>
 __aicore__ inline void KernelUnique<T>::MrgBlock()
 {
+    // 单tile直接返回
     if (tileNum <= 1) return;
 
+    // tile间多路归并，以4-way为单位推进：4 -> 16 -> 64 ... 直到覆盖所有tile
     bool switchFlag = false;
-    // bindTile: how many original tiles each "logical sequence" at this level comprises
-    // Level 0: bindTile=1 (each tile is a sequence)
-    // Level 1: bindTile=4 (each sequence spans 4 tiles)
-    // Level 2: bindTile=16, etc.
     for (int32_t bindTile = 1; bindTile < (int32_t)tileNum; bindTile *= 4) {
         GlobalTensor<T>& srcGM = switchFlag ? sortedBlock2 : sortedBlock1;
         GlobalTensor<T>& dstGM = switchFlag ? sortedBlock1 : sortedBlock2;
-
         for (int32_t tileIdx = 0; tileIdx < (int32_t)tileNum; tileIdx += bindTile * 4) {
+            // 计算当前归并组内每个分组的tile数量，有多少分组，及最后一个分组的tile数量（可能不足bindTile）
             int32_t mrgTileNum = MIN((int32_t)tileNum - tileIdx, bindTile * 4);
             int32_t numSeqs = (mrgTileNum + bindTile - 1) / bindTile;
             int32_t lastSeqTiles = mrgTileNum - (numSeqs - 1) * bindTile;
-
-            // Compute source offsets and lengths for each sequence in this group
+            //计算所有分组的起始offset和长度，单位为元素(非字节，字节要x2)，后续直接用来访问GM
             int32_t seqOffsets[4], seqLengths[4];
             for (int32_t i = 0; i < numSeqs; i++) {
                 seqOffsets[i] = (tileIdx + bindTile * i) * TILE_LENGTH;
                 seqLengths[i] = (i < numSeqs - 1) ? (bindTile * TILE_LENGTH) : (lastSeqTiles * TILE_LENGTH);
             }
+            //不足4个分组的，offset和长度置0，后续访问时相当于访问空序列
             for (int32_t i = numSeqs; i < 4; i++) {
                 seqOffsets[i] = 0;
                 seqLengths[i] = 0;
             }
-
             int32_t dstOffset = tileIdx * TILE_LENGTH;
-
             if (numSeqs == 1) {
-                // Single sequence: direct copy from src to dst (for ping-pong)
+                //单分组直接复制到目标位置，利用ping-pong buffer实现原地归并
                 DataCopyGM2GM(dstGM[dstOffset * SORT_DATATYPE_SIZE_FACTOR],
                     srcGM[seqOffsets[0] * SORT_DATATYPE_SIZE_FACTOR],
                     calcBuf[0].template Get<T>(),
                     seqLengths[0] * SORT_DATATYPE_SIZE_FACTOR, TILE_LEN_BYTE);
             } else {
+                //多分组调用MergeGroupOnGM归并函数，进行4-way归并
                 MergeGroupOnGM(dstGM, dstOffset, srcGM, seqOffsets, seqLengths, numSeqs);
             }
         }
@@ -654,92 +640,14 @@ __aicore__ inline void KernelUnique<T>::MrgGlobal()
     }
 }
 
-template<typename T>
-__aicore__ inline void KernelUnique<T>::ConsecutiveUnique(
-    const LocalTensor<float>& dstVal,
-    const LocalTensor<float>& srcLocal,
-    const LocalTensor<float>& shiftedLocal,
-    const LocalTensor<uint32_t>& bitMask32,
-    const uint16_t elemLength,
-    uint64_t& tileUniqueCnt)
-{
-    uint64_t rsvdCnt = 0;
-    // Step 1: 从交织数据 (val0,idx0,val1,idx1,...) 中提取 val 到 dstVal
-    GatherMask(dstVal, srcLocal, 1, false, 0,
-        {1, static_cast<uint16_t>((elemLength * 2 + 63) / 64), 8, 0}, rsvdCnt);
-    PipeBarrier<PIPE_V>();
-    // Step 2: 构造左移掩码 0b...11111110（跳过 bit0）
-    Duplicate(bitMask32, (uint32_t)0xFFFFFFFF, (elemLength + 31) / 32);
-    PipeBarrier<PIPE_V>();
-    bitMask32.SetValue(0, 0xFFFFFFFE);
-    // Step 3: 将 dstVal 左移一位 → shiftedLocal[i] = dstVal[i+1]
-    GatherMask(shiftedLocal, dstVal, bitMask32, true, elemLength, {1, 1, 0, 0}, rsvdCnt);
-    PipeBarrier<PIPE_V>();
-    // 尾部放哨兵，确保最后一个元素一定被标记为 unique
-    shiftedLocal.SetValue(elemLength - 1, -FLOAT_INF);
-    // Step 4: 比较 dstVal != shiftedLocal，找到每段相同值的末次出现位置
-    LocalTensor<uint32_t> neMask = bitMask32[TILE_LENGTH / 2].ReinterpretCast<uint32_t>();
-    LocalTensor<uint8_t> neMask8 = neMask.ReinterpretCast<uint8_t>();
-    Compare(neMask8, dstVal, shiftedLocal, CMPMODE::NE, (elemLength + 63) / 64 * 64);
-    PipeBarrier<PIPE_V>();
-    // Step 5: 用 NE 掩码从 dstVal 中压缩出唯一值 → shiftedLocal
-    GatherMask(shiftedLocal, dstVal, neMask, true, elemLength, {1, 1, 0, 0}, tileUniqueCnt);
-    PipeBarrier<PIPE_V>();
-}
-
-template<typename T>
-__aicore__ inline void KernelUnique<T>::CalculateUnique()
-{
-    float lastValue = FLOAT_INF;  // 不会和任何真实值相等
-    uint32_t totalUniqueCnt = 0;
-
-    // 计算当前 block 内的真实数据长度（排除 padding）
-    int32_t blockRealLength = MIN((int32_t)blockLength,
-                                   (int32_t)totalLength - (int32_t)globalOffset);
-
-    for (int32_t tileIdx = 0; tileIdx < (int32_t)this->tileNum; tileIdx++) {
-        int32_t remaining = blockRealLength - tileIdx * TILE_LENGTH;
-        if (remaining <= 0) break;
-        uint16_t elemLength = (uint16_t)MIN((int32_t)TILE_LENGTH, remaining);
-
-        LocalTensor<uint32_t> bitMask32 = calcBuf[0].Get<uint32_t>();
-        LocalTensor<float> shiftedLocal = bitMask32[TILE_LENGTH].ReinterpretCast<float>();
-        LocalTensor<float> sortedLocal = calcBuf[1].Get<float>();
-        LocalTensor<float> dstVal = calcBuf[2].Get<float>();
-        // 加载整个 tile 的排序数据（交织格式 val+idx）
-        DataCopy(sortedLocal, sortedBlock1[tileIdx * TILE_LEN_ELEM], TILE_LEN_ELEM);
-        PipeBarrier<PIPE_ALL>();
-        // 提取当前 tile 内的唯一值，结果在 shiftedLocal[0..tileUniqueCnt-1]
-        uint64_t tileUniqueCnt = 0;
-        ConsecutiveUnique(dstVal, sortedLocal, shiftedLocal, bitMask32, elemLength, tileUniqueCnt);
-        // 跨 tile 边界去重：如果本 tile 第一个唯一值和上一个 tile 最后一个相同，则跳过
-        bool skipFirst = (tileUniqueCnt > 0 && shiftedLocal.GetValue(0) == lastValue);
-        // 更新 lastValue 为本 tile 最后一个唯一值
-        if (tileUniqueCnt > 0) {
-            lastValue = shiftedLocal.GetValue(tileUniqueCnt - 1);
-        }
-        uint32_t writeOffset = skipFirst ? 1 : 0;
-        uint32_t writeLen = (uint32_t)tileUniqueCnt - writeOffset;
-        if (writeLen > 0) {
-            DataCopyPad(dstGlobal[totalUniqueCnt],
-                        shiftedLocal[writeOffset].ReinterpretCast<T>(),
-                        {1, static_cast<uint16_t>(sizeof(float) * writeLen), 0, 0});
-            PipeBarrier<PIPE_ALL>();
-            totalUniqueCnt += writeLen;
-        }
-    }
-    // 将 uniqueCnt 写回 GM
-    LocalTensor<int32_t> tmp = calcBuf[1].Get<int32_t>();
-    tmp.SetValue(0, static_cast<int32_t>(totalUniqueCnt));
-    DataCopyPad(uniqueCntGlobal[0], tmp,
-        {1, static_cast<uint16_t>(sizeof(int32_t)), 0, 0});
-    PipeBarrier<PIPE_ALL>();
-}
 
 
 template <typename T>
 __aicore__ inline void KernelUnique<T>::CopyOut()
 {
+
+    CopyOutUnique();
+    
     if (flagCounts) {
         CopyOutCounts();
         PipeBarrier<PIPE_ALL>();

@@ -106,9 +106,9 @@ static ge::graphStatus UniqueV3TilingFunc(gert::TilingContext* context)
     if (currentWorkspace == nullptr) {
         return ge::GRAPH_FAILED;
     }
-    size_t usrSize = (blockNum * BYTE_PER_BLK * EVENTID_MAX + aivNum * BYTE_PER_BLK + BYTE_PER_BLK) +
-                     (blockNum + BYTE_PER_BLK - 1) / BYTE_PER_BLK * BYTE_PER_BLK +
-                     (tileNum * tileLength) * 2 * sizeof(float) * 2;
+    size_t usrSize = (tileNum * tileLength) * 2 * sizeof(float) * 2 +  
+                     (blockNum * BYTE_PER_BLK * EVENTID_MAX + aivNum * BYTE_PER_BLK + BYTE_PER_BLK) +
+                     ((blockNum + BYTE_PER_BLK - 1) / BYTE_PER_BLK * BYTE_PER_BLK) * sizeof(uint32_t) * 3;
     // counts 统计count的临时空间 + 每个block头尾的值 + 每个block的unique个数
     // 这里blockNum也要对齐到32字节，因为后面要拷贝到UE上操作
     size_t countSize = (tileNum * tileLength) * sizeof(int32_t) + ((blockNum + BYTE_PER_BLK - 1) / BYTE_PER_BLK * BYTE_PER_BLK) * sizeof(uint32_t) * 3;
