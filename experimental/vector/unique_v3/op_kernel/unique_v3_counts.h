@@ -145,11 +145,12 @@ __aicore__ inline void KernelUnique<T>::CopyOutCounts()
     bool skipLast = false;
     if(GetBlockIdx() != blockNum - 1){
         float firstNext = counterMsg.GetValue((GetBlockIdx() + 1) * 3);
-        skipLast = first == firstNext;
+        skipLast = last == firstNext;
     }
     // 极端情况（block长度为1又被后面覆盖）不用写直接返回
     if(countLen == 1 && skipLast) return;
     // 拷贝workspace数据到counts里
+    int32_t firstCounter = counterGlobal.GetValue(GetGlobalOffset(GetBlockIdx())) + firstNumCntAdd; 
     DataCopyGM2GM(
         counterResult[offset],
         counterGlobal[GetGlobalOffset(GetBlockIdx())],
@@ -158,7 +159,7 @@ __aicore__ inline void KernelUnique<T>::CopyOutCounts()
         (countLen - (skipLast ? 1 : 0)) * sizeof(int32_t));
     // 最后把累加值加到头上
     LocalTensor<int32_t> tmp = calcBuf[1].Get<int32_t>();
-    tmp.SetValue(0, counterGlobal.GetValue(GetGlobalOffset(GetBlockIdx())) + firstNumCntAdd);
+    tmp.SetValue(0, firstCounter);
     DataCopyPad(counterResult[offset], tmp, {1, static_cast<uint16_t>(sizeof(uint32_t)), 0, 0, 0});
     PipeBarrier<PIPE_ALL>();
 }
