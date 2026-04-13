@@ -38,7 +38,7 @@ private:
     __aicore__ inline void MrgBlock();
     __aicore__ inline void MrgGlobal();
 
-    __aicore__ inline static int32_t BinarySearchLE(
+    __aicore__ inline static int32_t BinarySearchGE(
         const GlobalTensor<T>& gm, int32_t startElem, int32_t maxCount, T target);
     __aicore__ inline void MergeGroupOnGM(
         GlobalTensor<T>& dstGM, int32_t dstElemOffset,
@@ -122,6 +122,7 @@ private:
     uint8_t shortBlockNum;
     size_t globalOffset;
     size_t blockLength;
+    size_t blockRealLength;
 
     bool hasInfFlag {false};
     bool flagInverse {false};
@@ -153,10 +154,11 @@ __aicore__ inline void KernelUnique<T>::Init(
     this->blockLength = this->tileNum * TILE_LENGTH;
     this->globalOffset = GetGlobalOffset(GetBlockIdx());
     this->syncWorkspaceSize = (blockNum * 32 * 8 + aivNum * 32 + 32) / sizeof(int32_t);
+    this->blockRealLength = MIN((int32_t)blockLength, (int32_t)totalLength - (int32_t)globalOffset);
 
     // 初始化输入及输出 GM空间
     srcGlobal.SetGlobalBuffer((__gm__ T*)input, alignedTotalLength);
-    srcBlock.SetGlobalBuffer((__gm__ T*)input + globalOffset, this->blockLength);
+    srcBlock.SetGlobalBuffer((__gm__ T*)input + globalOffset, this->blockRealLength);
 
     dstGlobal.SetGlobalBuffer((__gm__ T*)output, alignedTotalLength);
     uniqueCntGlobal.SetGlobalBuffer((__gm__ int32_t*)uniqueCnt, 1);
@@ -177,7 +179,7 @@ __aicore__ inline void KernelUnique<T>::Init(
     uniqueMsg.SetGlobalBuffer((__gm__ float*)workspace + alignedTotalLength * SORT_DATATYPE_SIZE_FACTOR * 2 + syncWorkspaceSize, ((blockNum + 7) / 8 * 8) * 3); 
 
     // 初始化counter及inverse GM临时空间
-    uint32_t counterOffset = alignedTotalLength * 4 + syncWorkspaceSize + (blockNum + 7) / 8 * 8;
+    uint32_t counterOffset = alignedTotalLength * 4 + syncWorkspaceSize + ((blockNum + 7) / 8 * 8) * 3;
     uint32_t inverstOffset = counterOffset + alignedTotalLength + ((blockNum + 7) / 8 * 8) * 3;
     counterGlobal.SetGlobalBuffer((__gm__ int32_t*)workspace + counterOffset, alignedTotalLength);
     counterMsg.SetGlobalBuffer((__gm__ float*)workspace + counterOffset + alignedTotalLength, ((blockNum + 7) / 8 * 8) * 3);
@@ -233,29 +235,27 @@ __aicore__ inline void KernelUnique<T>::SortTile()
     LocalTensor<float> input = calcBuf[0].Get<float>();
     LocalTensor<int32_t> arange = calcBuf[1].Get<int32_t>();
     for (uint32_t i = 0; i < tileNum; i++) {
-        int32_t tileLen = MIN(TILE_LENGTH, blockLength - i * TILE_LENGTH);
+        int32_t tileLen = MIN(TILE_LENGTH, blockRealLength - i * TILE_LENGTH);
         uint32_t repeat = (tileLen + 31) / 32;
         AscendC::Duplicate<float>(input, -FLOAT_INF, TILE_LENGTH);
         SyncDiffPipe<AscendC::HardEvent::V_MTE2>();
         AscendC::DataCopyPad(input, srcBlock[i * TILE_LENGTH], 
             {1, static_cast<uint32_t>(tileLen * sizeof(float)), 0, 0, 0}, {false, 0, 0, 0});
         SyncDiffPipe<AscendC::HardEvent::MTE2_V>();
-	//构造递增数组用于后续inverse计算
-        AscendC::Arange(arange, static_cast<int32_t>(globalOffset + i * TILE_LENGTH), 1, tileLen);
+	    //构造递增数组用于后续inverse计算
+        AscendC::Arange(arange, static_cast<int32_t>(globalOffset + i * TILE_LENGTH), 1, TILE_LENGTH);
         LocalTensor<float> dstLocal = calcBuf[2].Get<float>();
-	//255个repeat超限 拆成两次排
-	if(repeat <=128) AscendC::Sort32<float>(dstLocal, input, arange.ReinterpretCast<uint32_t>(), repeat);
-	else {
-	    AscendC::Sort32<float>(dstLocal, input, arange.ReinterpretCast<uint32_t>(), 128);
-	    AscendC::Sort32<float>(dstLocal[TILE_LENGTH], input[TILE_LENGTH / 2], arange[TILE_LENGTH / 2].ReinterpretCast<uint32_t>(), repeat - 128);
-	}
-	bool readFromSort = MrgTile(dstLocal, input, tileLen);
-        //tile内排序完成后写入GM
-        SyncDiffPipe<AscendC::HardEvent::V_MTE3>();
-        AscendC::DataCopyPad(sortedBlock1[i * TILE_LENGTH * 2],
-                             readFromSort ? dstLocal : input,
-                             {2, static_cast<uint16_t>(sizeof(float) * TILE_LENGTH), 0, 0});
-        SyncDiffPipe<AscendC::HardEvent::MTE3_V>();
+	    //255个repeat超限 拆成两次排
+        AscendC::Sort32<float>(dstLocal, input, arange.ReinterpretCast<uint32_t>(), 128);
+        AscendC::Sort32<float>(dstLocal[TILE_LENGTH], input[TILE_LENGTH / 2], arange[TILE_LENGTH / 2].ReinterpretCast<uint32_t>(), 128);
+        
+        bool readFromSort = MrgTile(dstLocal, input, TILE_LENGTH);
+            //tile内排序完成后写入GM
+            SyncDiffPipe<AscendC::HardEvent::V_MTE3>();
+            AscendC::DataCopyPad(sortedBlock1[i * TILE_LENGTH * 2],
+                                readFromSort ? dstLocal : input,
+                                {2, static_cast<uint16_t>(sizeof(float) * TILE_LENGTH), 0, 0});
+            SyncDiffPipe<AscendC::HardEvent::MTE3_V>();
     }
     AscendC::PipeBarrier<PIPE_ALL>();
 }
@@ -316,21 +316,20 @@ __aicore__ inline bool KernelUnique<T>::MrgTile(
 
 
 template <typename T>
-__aicore__ inline int32_t KernelUnique<T>::BinarySearchLE(
+__aicore__ inline int32_t KernelUnique<T>::BinarySearchGE(
     const GlobalTensor<T>& gm, int32_t startElem, int32_t maxCount, T target)
 {
     if (maxCount <= 0) return 0;
     T firstVal = gm.GetValue(startElem * SORT_DATATYPE_SIZE_FACTOR);
-    if (firstVal > target) return 0;
+    if (firstVal < target) return 0;
     if (maxCount == 1) return 1;
     T lastVal = gm.GetValue((startElem + maxCount - 1) * SORT_DATATYPE_SIZE_FACTOR);
-    if (lastVal <= target) return maxCount;
-
+    if (lastVal >= target) return maxCount;
     int32_t lo = 0, hi = maxCount - 1;
     while (lo < hi) {
         int32_t mid = (lo + hi + 1) / 2;
         T midVal = gm.GetValue((startElem + mid) * SORT_DATATYPE_SIZE_FACTOR);
-        if (midVal <= target) {
+        if (midVal >= target) {
             lo = mid;
         } else {
             hi = mid - 1;
@@ -395,17 +394,17 @@ __aicore__ inline void KernelUnique<T>::MergeGroupOnGM(
                 int32_t pos = MIN(bufLen - 1, remaining[i] - 1);
                 boundaryVal[i] = srcGM.GetValue((curOff[i] + pos) * SORT_DATATYPE_SIZE_FACTOR);
             } else {
-                boundaryVal[i] = (T)FLOAT_INF;
+                boundaryVal[i] = -((T)FLOAT_INF); // 负无穷，确保不会被选为 max
             }
         }
 
         // Step 2: Find sequence with MINIMUM boundary value (ascending sort bottleneck)
-        int32_t minIdx = -1;
-        T minVal = (T)FLOAT_INF;
+        int32_t maxIdx = -1;
+        T maxVal = -((T)FLOAT_INF);
         for (int32_t i = 0; i < 4; i++) {
-            if (remaining[i] > 0 && boundaryVal[i] < minVal) {
-                minVal = boundaryVal[i];
-                minIdx = i;
+            if (remaining[i] > 0 && boundaryVal[i] > maxVal) {
+                maxVal = boundaryVal[i];
+                maxIdx = i;
             }
         }
 
@@ -413,10 +412,10 @@ __aicore__ inline void KernelUnique<T>::MergeGroupOnGM(
         // The min-boundary sequence contributes up to bufLen elements
         // Other sequences: binary search for last index with value <= minVal
         int32_t counts[4] = {0, 0, 0, 0};
-        counts[minIdx] = MIN(bufLen, remaining[minIdx]);
+        counts[maxIdx] = MIN(bufLen, remaining[maxIdx]);
         for (int32_t i = 0; i < 4; i++) {
-            if (i == minIdx || remaining[i] <= 0) continue;
-            counts[i] = BinarySearchLE(srcGM, curOff[i], MIN(bufLen, remaining[i]), minVal);
+            if (i == maxIdx || remaining[i] <= 0) continue;
+            counts[i] = BinarySearchGE(srcGM, curOff[i], MIN(bufLen, remaining[i]), maxVal);
         }
 
         // Step 4: Load data into UB input buffers (compact into consecutive buffers)

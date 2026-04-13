@@ -46,9 +46,6 @@ __aicore__ inline void KernelUnique<T>::CalculateUnique()
     uint32_t localUniqueCnt = 0;
     float firstUniqueVal = FLOAT_INF;
 
-    int32_t blockRealLength = MIN((int32_t)blockLength,
-                                   (int32_t)totalLength - (int32_t)globalOffset);
-
     for (int32_t tileIdx = 0; tileIdx < (int32_t)this->tileNum; tileIdx++) {
         int32_t remaining = blockRealLength - tileIdx * TILE_LENGTH;
         if (remaining <= 0) break;
@@ -98,7 +95,6 @@ __aicore__ inline void KernelUnique<T>::CalculateUnique()
         {1, static_cast<uint16_t>(sizeof(float) * 3), 0, 0});
     PipeBarrier<PIPE_ALL>();
 }
-
 
 template<typename T>
 __aicore__ inline void KernelUnique<T>::CopyOutUnique()

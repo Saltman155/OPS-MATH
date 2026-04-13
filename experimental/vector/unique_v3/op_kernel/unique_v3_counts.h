@@ -71,16 +71,9 @@ __aicore__ inline void KernelUnique<T>::CalculateCounts()
     float beforeNumValue = -FLOAT_INF;
     float first = 0.0f, last = 0.0f;
     uint32_t offset = GetGlobalOffset(GetBlockIdx());
-    int32_t blockRealLength = MIN((int32_t)blockLength, (int32_t)totalLength - (int32_t)globalOffset);
 
     for (int32_t tileIdx = 0; tileIdx < this->tileNum; tileIdx++) {
         int32_t progress = tileIdx;
-
-        // 计算当前 tile 的有效元素数
-        int32_t remaining = blockRealLength - tileIdx * TILE_LENGTH;
-        if (remaining <= 0) break;
-        uint16_t elemLength = (uint16_t)MIN((int32_t)TILE_LENGTH, remaining);
-
         LocalTensor<uint32_t> bitMask32 = calcBuf[0].Get<uint32_t>();
         LocalTensor<float> shiftedLocal = bitMask32[TILE_LENGTH].ReinterpretCast<float>();
         LocalTensor<float> sortedLocal1 = calcBuf[1].Get<float>();
@@ -89,13 +82,13 @@ __aicore__ inline void KernelUnique<T>::CalculateCounts()
         uint64_t arrayLen;
         DataCopy(sortedLocal1, sortedBlock1[progress * TILE_LEN_ELEM], TILE_LEN_ELEM);
         PipeBarrier<PIPE_ALL>();
-        if(tileIdx == 0) {
+        if(tileIdx == 0) { 
             first = sortedLocal1.GetValue(0);
         }
         // 计算单tile内的counts，并判断是否需要和上一个tile连接
         bool shifted = TileCalculateCounts(
-            sortedLocal2, sortedLocal1, shiftedLocal,
-            bitMask32, elemLength, arrayLen,
+            sortedLocal2, sortedLocal1, shiftedLocal, 
+            bitMask32, TILE_LENGTH, arrayLen, 
             beforeNumCnt, beforeNumValue);
         // 把结果写回counterGlobal
         DataCopyPad(counterGlobal[offset - (shifted ? 1 : 0)], sortedLocal1.ReinterpretCast<int32_t>(),
@@ -160,6 +153,7 @@ __aicore__ inline void KernelUnique<T>::CopyOutCounts()
     // 最后把累加值加到头上
     LocalTensor<int32_t> tmp = calcBuf[1].Get<int32_t>();
     tmp.SetValue(0, firstCounter);
+    SyncDiffPipe<AscendC::HardEvent::S_MTE3>();
     DataCopyPad(counterResult[offset], tmp, {1, static_cast<uint16_t>(sizeof(uint32_t)), 0, 0, 0});
     PipeBarrier<PIPE_ALL>();
 }
