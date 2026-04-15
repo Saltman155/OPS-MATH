@@ -430,8 +430,8 @@ int RunUniqueV3Test(
 
 int main()
 {
-    const int64_t N = 393256;
-    const int32_t VALUE_RANGE = 30000;
+    const int64_t N = 10000000;
+    const int32_t VALUE_RANGE = 50000;
 
     LOG_PRINT("========================================\n");
     LOG_PRINT("UniqueV3 Test Suite (float32, integer-valued)\n");

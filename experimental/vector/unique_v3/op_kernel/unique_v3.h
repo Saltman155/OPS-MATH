@@ -251,11 +251,11 @@ __aicore__ inline void KernelUnique<T>::SortTile()
         
         bool readFromSort = MrgTile(dstLocal, input, TILE_LENGTH);
             //tile内排序完成后写入GM
-            SyncDiffPipe<AscendC::HardEvent::V_MTE3>();
-            AscendC::DataCopyPad(sortedBlock1[i * TILE_LENGTH * 2],
-                                readFromSort ? dstLocal : input,
-                                {2, static_cast<uint16_t>(sizeof(float) * TILE_LENGTH), 0, 0});
-            SyncDiffPipe<AscendC::HardEvent::MTE3_V>();
+        SyncDiffPipe<AscendC::HardEvent::V_MTE3>();
+        AscendC::DataCopyPad(sortedBlock1[i * TILE_LENGTH * 2],
+                            readFromSort ? dstLocal : input,
+                            {2, static_cast<uint16_t>(sizeof(float) * TILE_LENGTH), 0, 0});
+        SyncDiffPipe<AscendC::HardEvent::MTE3_V>();
     }
     AscendC::PipeBarrier<PIPE_ALL>();
 }
@@ -545,10 +545,6 @@ __aicore__ inline void KernelUnique<T>::MrgBlock()
     AscendC::PipeBarrier<PIPE_ALL>();
 }
 
-// ======================== MrgGlobal: Inter-core Block Merge ========================
-// Multi-level 4-way merge of sorted blocks across cores.
-// Only the "leader" block in each group performs the merge.
-// Other blocks signal readiness via IBSet/IBWait.
 template <typename T>
 __aicore__ inline void KernelUnique<T>::MrgGlobal()
 {

@@ -104,7 +104,7 @@ __aicore__ inline void KernelUnique<T>::CopyOriginalArrayIdx2GM(
     PipeBarrier<PIPE_V>();
     DataCopy(idxLocal[TILE_LENGTH], tmpLocalFloat, TILE_LENGTH);
     PipeBarrier<PIPE_V>();
-    DataCopyPad(inverseBlock1[progress * TILE_LEN_ELEM], idxLocal.ReinterpretCast<int32_t>(), {1, sizeof(uint32_t) * TILE_LEN_ELEM, 0, 0, 0});
+    DataCopyPad(inverseBlock1[progress * TILE_LEN_ELEM], idxLocal.ReinterpretCast<int32_t>(), {2, sizeof(uint32_t) * TILE_LENGTH, 0, 0, 0});
     PipeBarrier<PIPE_ALL>();
 }
 
@@ -184,7 +184,7 @@ __aicore__ inline void KernelUnique<T>::BlockCumulativeSum()
         PipeBarrier<PIPE_ALL>();
         Adds(tmpLocal1, tmpLocal1, unique, TILE_LENGTH);
         PipeBarrier<PIPE_V>();
-        DataCopyPad(inverseBlock2[tileIdx * TILE_LEN_ELEM], tmpLocal1, {1, sizeof(uint32_t) * TILE_LEN_ELEM, 0, 0, 0});
+        DataCopyPad(inverseBlock2[tileIdx * TILE_LEN_ELEM], tmpLocal1, {2, sizeof(uint32_t) * TILE_LENGTH, 0, 0, 0});
         PipeBarrier<PIPE_ALL>();
     }
 

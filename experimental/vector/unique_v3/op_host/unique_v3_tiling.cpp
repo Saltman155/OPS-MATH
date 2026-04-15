@@ -69,8 +69,6 @@ static ge::graphStatus UniqueV3TilingFunc(gert::TilingContext* context)
     const auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
 
     const uint32_t aivNum = ascendcPlatform.GetCoreNumAiv();
-    // const uint32_t aivNum = 1;
-
 
     const uint8_t blockNum = tileNum >= aivNum ? aivNum : tileNum;
     const uint32_t shortBlockTileNum = tileNum / blockNum;
@@ -91,9 +89,6 @@ static ge::graphStatus UniqueV3TilingFunc(gert::TilingContext* context)
     tiling->shortBlockNum = shortBlockNum;
     tiling->flagInverse = flagInverse;
     tiling->flagCounts = flagCounts;
-
-
-    // printf("what is blockNum ? %d\n", blockNum);
 
     context->SetBlockDim(blockNum);
     if (context->GetRawTilingData() == nullptr) {
